@@ -3,6 +3,7 @@ import os
 import sys
 import time
 import threading
+import queue
 import psutil
 import tkinter as tk
 from PIL import Image, ImageDraw
@@ -24,23 +25,10 @@ def generate_default_icon():
         image.save(path, format='ICO')
     return path
 
-last_disk_io = psutil.disk_io_counters()
-last_time = time.time()
-last_page_faults = 0
-
-def get_total_page_faults():
-    faults = 0
-    for p in psutil.process_iter(['memory_info']):
-        try:
-            if p.info['memory_info']:
-                faults += p.info['memory_info'].num_page_faults
-        except: pass
-    return faults
-
 detail_window_open = False
 
 def show_detail_window():
-    global detail_window_open, last_disk_io, last_time, last_page_faults
+    global detail_window_open
     if detail_window_open: return
     detail_window_open = True
     
@@ -53,13 +41,14 @@ def show_detail_window():
     COLOR_YELLOW = "#facc15"
     COLOR_GREY = "#3b4d61"
     
-    w, h = 340, 520 
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
+    w = min(340, screen_w)
+    h = min(520, max(1, screen_h - 48))
     
     # Rata kanan sempurna dan persis di atas Taskbar Windows 11 (tinggi 48px)
     x = screen_w - w
-    y = screen_h - h - 48 
+    y = max(0, screen_h - h - 48)
     
     root.geometry(f"{w}x{h}+{x}+{y}")
     root.overrideredirect(True)
@@ -84,6 +73,26 @@ def show_detail_window():
     main_frame.bind("<ButtonRelease-1>", stop_move)
     main_frame.bind("<B1-Motion>", do_move)
     main_frame.bind("<Button-3>", lambda e: (setattr(sys.modules[__name__], 'detail_window_open', False), root.destroy()))
+    stop_event = threading.Event()
+    metrics_queue = queue.Queue(maxsize=1)
+
+    def stop_updates(event):
+        global detail_window_open
+        if event.widget is root:
+            stop_event.set()
+            detail_window_open = False
+
+    root.bind("<Destroy>", stop_updates)
+
+    def publish_metrics(metrics):
+        try:
+            metrics_queue.put_nowait(metrics)
+        except queue.Full:
+            try:
+                metrics_queue.get_nowait()
+            except queue.Empty:
+                pass
+            metrics_queue.put_nowait(metrics)
 
     # SCROLL FRAME DENGAN SCROLLBAR TERSEMBUNYI (TAPI TETAP BISA DI-SCROLL)
     scroll_frame = ctk.CTkScrollableFrame(
@@ -114,6 +123,8 @@ def show_detail_window():
     ram_arc = draw_ring(canvas, 215, 55, 38, 7, 0, COLOR_CYAN, COLOR_GREY)
     ram_pct_text = canvas.create_text(215, 48, text="0%", fill="white", font=("Segoe UI", 12, "bold"))
     canvas.create_text(215, 68, text="RAM", fill="#a1b0c0", font=("Segoe UI", 8))
+    status_var = ctk.StringVar(value="Memuat metrik...")
+    ctk.CTkLabel(scroll_frame, textvariable=status_var, text_color="#a1b0c0", font=("Segoe UI", 9)).pack(pady=(0, 4))
 
     # HELPER KARTU DENGAN SUDUT MELENGKUNG DI DALAMNYA
     def create_card(parent):
@@ -188,90 +199,111 @@ def show_detail_window():
     add_row(card_commit, 3, "Page file", pagefile_var)
     ctk.CTkFrame(card_commit, height=4, fg_color="transparent").grid(row=4, column=0)
 
-    last_page_faults = get_total_page_faults()
+    def collect_data():
+        previous_disk_io = psutil.disk_io_counters()
+        previous_time = time.monotonic()
+        previous_page_faults = None
+
+        while not stop_event.is_set():
+            try:
+                current_time = time.monotonic()
+                time_diff = max(current_time - previous_time, 1)
+                disk = psutil.disk_usage('/')
+                current_disk_io = psutil.disk_io_counters()
+                ram = psutil.virtual_memory()
+                swap = psutil.swap_memory()
+
+                processes = []
+                current_page_faults = 0
+                for process in psutil.process_iter(['name', 'memory_info']):
+                    try:
+                        info = process.info
+                        memory = info['memory_info']
+                        if memory is None:
+                            continue
+                        current_page_faults += memory.num_page_faults
+                        name = info['name']
+                        if name:
+                            processes.append((name, memory.rss))
+                    except (psutil.Error, OSError, AttributeError):
+                        continue
+
+                processes.sort(key=lambda process: process[1], reverse=True)
+                unique_processes = []
+                seen = set()
+                for name, memory in processes:
+                    normalized_name = name.lower()
+                    if normalized_name not in seen and normalized_name not in ('system idle process', 'system'):
+                        seen.add(normalized_name)
+                        unique_processes.append((name.replace(".exe", "").lower(), memory))
+                    if len(unique_processes) == 7:
+                        break
+
+                if previous_disk_io is None or current_disk_io is None:
+                    disk_read = disk_write = "N/A"
+                else:
+                    disk_read = f"{max(0, current_disk_io.read_bytes - previous_disk_io.read_bytes) / time_diff / 1024:.1f} KB/s"
+                    disk_write = f"{max(0, current_disk_io.write_bytes - previous_disk_io.write_bytes) / time_diff / 1024:.1f} KB/s"
+
+                metrics = {
+                    "disk_percent": disk.percent,
+                    "disk_free": f"{disk.free / (1024**3):.1f} GB / {disk.total / (1024**3):.0f} GB",
+                    "disk_read": disk_read,
+                    "disk_write": disk_write,
+                    "ram_percent": ram.percent,
+                    "ram_in_use": f"{ram.used / (1024**3):.1f} GB",
+                    "ram_cached": f"{(ram.available - ram.free) / (1024**2):.1f} MB",
+                    "ram_free": f"{ram.free / (1024**2):.1f} MB" if ram.free < 1024**3 else f"{ram.free / (1024**3):.1f} GB",
+                    "processes": [(name, f"{memory / (1024**2):.1f} MB") for name, memory in unique_processes],
+                    "commit": f"{swap.used / (1024**3):.1f} GB / {swap.total / (1024**3):.1f} GB",
+                    "pagefile": f"{swap.percent}% used",
+                    "faults": f"{int((current_page_faults - previous_page_faults) / time_diff):,}" if previous_page_faults is not None else "0",
+                }
+                previous_disk_io = current_disk_io
+                previous_time = current_time
+                previous_page_faults = current_page_faults
+                publish_metrics(metrics)
+            except (psutil.Error, OSError) as error:
+                publish_metrics({"error": str(error)})
+
+            stop_event.wait(1)
 
     def update_data():
-        global last_disk_io, last_time, last_page_faults
-        if not detail_window_open: return
-            
-        current_time = time.time()
-        time_diff = current_time - last_time if current_time - last_time > 0 else 1
-        
-        # DISK
-        disk = psutil.disk_usage('/')
-        disk_pct = disk.percent
-        disk_free_gb = disk.free / (1024**3)
-        disk_total_gb = disk.total / (1024**3)
-        disk_free_var.set(f"{disk_free_gb:.1f} GB / {disk_total_gb:.0f} GB")
-        
-        current_disk_io = psutil.disk_io_counters()
-        read_bps = (current_disk_io.read_bytes - last_disk_io.read_bytes) / time_diff
-        write_bps = (current_disk_io.write_bytes - last_disk_io.write_bytes) / time_diff
-        
-        disk_read_var.set(f"{read_bps / 1024:.1f} KB/s")
-        disk_write_var.set(f"{write_bps / 1024:.1f} KB/s")
-        
-        canvas.itemconfig(disk_arc, extent=-(disk_pct / 100.0) * 360)
-        canvas.itemconfig(disk_pct_text, text=f"{int(disk_pct)}%")
-        
-        # RAM
-        ram = psutil.virtual_memory()
-        ram_pct = ram.percent
-        ram_inuse_gb = ram.used / (1024**3)
-        ram_free_mb = ram.free / (1024**2)
-        ram_cached_mb = (ram.available - ram.free) / (1024**2)
-        
-        ram_inuse_var.set(f"{ram_inuse_gb:.1f} GB")
-        ram_cached_var.set(f"{ram_cached_mb:.1f} MB")
-        ram_free_var.set(f"{ram_free_mb:.1f} MB" if ram_free_mb < 1024 else f"{ram_free_mb/1024:.1f} GB")
-        
-        canvas.itemconfig(ram_arc, extent=-(ram_pct / 100.0) * 360)
-        canvas.itemconfig(ram_pct_text, text=f"{int(ram_pct)}%")
-        
-        # PROCESSES
-        procs = []
-        for p in psutil.process_iter(['name', 'memory_info']):
-            try:
-                mem = p.info['memory_info'].rss
-                procs.append((p.info['name'], mem))
-            except: pass
-        procs.sort(key=lambda x: x[1], reverse=True)
-        
-        unique_procs = []
-        seen = set()
-        for name, mem in procs:
-            if name.lower() not in seen and name.lower() not in ['system idle process', 'system']:
-                seen.add(name.lower())
-                unique_procs.append((name.replace(".exe", ""), mem))
-            if len(unique_procs) >= 7: break
-            
-        for i in range(7):
-            if i < len(unique_procs):
-                name, mem = unique_procs[i]
-                mem_mb = mem / (1024**2)
-                proc_vars[i][0].set(name.lower())
-                proc_vars[i][1].set(f"{mem_mb:.1f} MB")
-            else:
-                proc_vars[i][0].set("")
-                proc_vars[i][1].set("")
-                
-        # COMMITTED
-        swap = psutil.swap_memory()
-        commit_used_gb = swap.used / (1024**3)
-        commit_total_gb = swap.total / (1024**3)
-        commit_var.set(f"{commit_used_gb:.1f} GB / {commit_total_gb:.1f} GB")
-        pagefile_var.set(f"{swap.percent}% used")
-        
-        current_faults = get_total_page_faults()
-        faults_diff = current_faults - last_page_faults
-        faults_var.set(f"{int(faults_diff / time_diff):,}")
-        
-        last_disk_io = current_disk_io
-        last_time = current_time
-        last_page_faults = current_faults
-        
-        root.after(1000, update_data)
+        if stop_event.is_set():
+            return
+        try:
+            metrics = metrics_queue.get_nowait()
+        except queue.Empty:
+            root.after(100, update_data)
+            return
 
+        if "error" in metrics:
+            status_var.set(f"Metrik tidak tersedia: {metrics['error']}")
+        else:
+            status_var.set("Metrik diperbarui")
+            disk_free_var.set(metrics["disk_free"])
+            disk_read_var.set(metrics["disk_read"])
+            disk_write_var.set(metrics["disk_write"])
+            canvas.itemconfig(disk_arc, extent=-(metrics["disk_percent"] / 100.0) * 360)
+            canvas.itemconfig(disk_pct_text, text=f"{int(metrics['disk_percent'])}%")
+            ram_inuse_var.set(metrics["ram_in_use"])
+            ram_cached_var.set(metrics["ram_cached"])
+            ram_free_var.set(metrics["ram_free"])
+            canvas.itemconfig(ram_arc, extent=-(metrics["ram_percent"] / 100.0) * 360)
+            canvas.itemconfig(ram_pct_text, text=f"{int(metrics['ram_percent'])}%")
+            for index, (name, memory) in enumerate(metrics["processes"]):
+                proc_vars[index][0].set(name)
+                proc_vars[index][1].set(memory)
+            for index in range(len(metrics["processes"]), 7):
+                proc_vars[index][0].set("")
+                proc_vars[index][1].set("")
+            commit_var.set(metrics["commit"])
+            pagefile_var.set(metrics["pagefile"])
+            faults_var.set(metrics["faults"])
+
+        root.after(100, update_data)
+
+    threading.Thread(target=collect_data, daemon=True).start()
     update_data()
     root.mainloop()
 
